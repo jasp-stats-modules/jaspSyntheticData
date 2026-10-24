@@ -77,6 +77,10 @@ prepare_for_synthpop <- function(dat) {
   for (col in names(dat)) {
     if (is.character(dat[[col]])) {
       dat[[col]] <- factor(dat[[col]])
+    } else if (is.numeric(dat[[col]])) {
+      # NaN (e.g., a row mean over all-missing items) breaks synthpop's
+      # collinearity check, while NA is handled as missing.
+      dat[[col]][is.nan(dat[[col]])] <- NA
     }
   }
   dat
@@ -255,7 +259,68 @@ aggregate_synthpop_replicates <- function(syn_object, reference,
   # --- Step 3: calibrate within-category conditional moments ----------------
   result <- calibrate_conditional_moments(result, reference, cat_cols, num_cols)
 
+  # --- Step 4: restore whole numbers ------------------------------------------
+  # Calibration rescales values, which turns whole-number columns (ages,
+  # rating scales) into decimals. Round any column whose observed values are
+  # all whole numbers; the clamp in calibration keeps the bounds whole, so
+  # rounding cannot leave the observed range.
+  for (col in num_cols) {
+    observed <- reference[[col]][!is.na(reference[[col]])]
+    if (length(observed) > 0L && all(observed == round(observed))) {
+      result[[col]] <- round(result[[col]])
+      if (is.integer(reference[[col]])) {
+        result[[col]] <- as.integer(result[[col]])
+      }
+    }
+  }
+
   result
+}
+
+#' Prepare the original and synthetic data for synthpop's utility functions.
+#'
+#' Utility is evaluated on the final synthetic dataset (after replicate
+#' selection and calibration), so the measures describe the data the
+#' user actually saves. Both datasets are coerced to plain data.frames with
+#' character columns as factors, and JASP-encoded column names are decoded so
+#' plot and table labels show the names the user sees.
+prepare_utility_data <- function(original, synthetic) {
+  original  <- prepare_for_synthpop(as.data.frame(original))
+  synthetic <- prepare_for_synthpop(as.data.frame(synthetic))
+  decoded <- tryCatch(
+    jaspBase::decodeColNames(names(original)),
+    error = function(e) names(original)
+  )
+  names(original)  <- decoded
+  names(synthetic) <- decoded
+  list(original = original, synthetic = synthetic)
+}
+
+#' Compare synthetic and original distributions with synthpop::compare().
+#'
+#' Returns the compare object, whose `tab.utility` holds the per-variable
+#' pMSE / S_pMSE table and whose `plots` holds a single ggplot with one panel
+#' per variable. The grid is sized so every variable fits in one figure.
+#' synthpop's compare() fails on one-column data, so a constant padding
+#' column is added in that case and excluded through `vars`.
+compare_synthetic <- function(original, synthetic) {
+  vars   <- names(original)
+  n_vars <- length(vars)
+  n_cols <- min(3L, n_vars)
+  n_rows <- ceiling(n_vars / n_cols)
+
+  if (n_vars == 1L) {
+    original$.pad  <- 0
+    synthetic$.pad <- 0
+  }
+
+  synthpop::compare(
+    synthetic, original,
+    vars       = vars,
+    nrow       = n_rows,
+    ncol       = n_cols,
+    print.flag = FALSE
+  )
 }
 
 syntheticData <- function(jaspResults, dataset, options, state, ...) {
@@ -374,7 +439,10 @@ syntheticData <- function(jaspResults, dataset, options, state, ...) {
     if (!is.character(method_input)) {
       method_input <- "cart"
     }
-    method <- rep(method_input, length.out = ncol(dat))
+    # Pass a single string so synthpop assigns per-variable methods itself;
+    # "parametric" is only valid in this form (it expands to normrank,
+    # polyreg, logreg, ... depending on each variable's type).
+    method <- method_input[[1L]]
 
     # FIX: coerce character columns → factors before calling synthpop so that
     #      the package fits an appropriate categorical model (polyreg / cart)
@@ -440,26 +508,6 @@ syntheticData <- function(jaspResults, dataset, options, state, ...) {
         syn[[col]] <- mapped
       }
     }
-
-    # -- Optional jitter on continuous numeric columns ------------------------
-    jitterFraction <- options$jitterFraction %||% 0
-    jitterFraction <- suppressWarnings(as.numeric(jitterFraction))
-    if (is.na(jitterFraction) || jitterFraction < 0)
-      jitterFraction <- 0
-    if (jitterFraction > 0 && length(numericCols) > 0) {
-      colSd <- vapply(
-        dat[, numericCols, drop = FALSE],
-        function(x) stats::sd(x, na.rm = TRUE),
-        numeric(1)
-      )
-      colSd[is.na(colSd)] <- 0
-      for (col in numericCols) {
-        sd_val <- colSd[col]
-        if (is.na(sd_val) || sd_val <= 0) next
-        noise <- stats::rnorm(n = n_target, mean = 0, sd = jitterFraction * sd_val)
-        syn[[col]] <- syn[[col]] + noise
-      }
-    }
   }
 
   # --- 4) Return results / preview ------------------------------------------
@@ -484,6 +532,94 @@ syntheticData <- function(jaspResults, dataset, options, state, ...) {
       synPreview$setData(headRows)
     }
     jaspResults[["syntheticPreview"]] <- synPreview
+
+    # -- Utility of the synthetic data ----------------------------------------
+    showUtilityTable <- isTRUE(options$utilityTable %||% TRUE)
+    showComparePlots <- isTRUE(options$comparisonPlots %||% TRUE)
+    showOverall      <- isTRUE(options$overallUtility %||% FALSE) && ncol(syn) > 1L
+
+    if (ncol(syn) > 0L && nrow(syn) > 0L &&
+        (showUtilityTable || showComparePlots || showOverall)) {
+      utilityData <- prepare_utility_data(dat, syn)
+
+      compareResult <- NULL
+      compareError  <- NULL
+      if (showUtilityTable || showComparePlots) {
+        compareResult <- tryCatch(
+          compare_synthetic(utilityData$original, utilityData$synthetic),
+          error = function(e) {
+            compareError <<- conditionMessage(e)
+            NULL
+          }
+        )
+      }
+
+      if (showUtilityTable) {
+        utilityTable <- jaspBase::createJaspTable(title = "Utility by Variable")
+        utilityTable$addColumnInfo(name = "variable", title = "Variable", type = "string")
+        utilityTable$addColumnInfo(name = "pMSE",     title = "pMSE",     type = "number", format = "sf:4")
+        utilityTable$addColumnInfo(name = "S_pMSE",   title = "S_pMSE",   type = "number", format = "dp:3")
+        utilityTable$addColumnInfo(name = "df",       title = "df",       type = "integer")
+        utilityTable$addFootnote(paste(
+          "pMSE is the propensity score mean squared error from a model that tries to",
+          "distinguish original from synthetic values; values near 0 indicate high utility.",
+          "S_pMSE is the pMSE divided by its expected value under a correct synthesis model;",
+          "values near 1 indicate good utility and larger values indicate poorer utility."
+        ))
+        if (is.null(compareResult)) {
+          utilityTable$setError(paste("Could not compute utility:", compareError))
+        } else {
+          tab <- compareResult$tab.utility
+          utilityTable$setData(data.frame(
+            variable = rownames(tab),
+            pMSE     = tab[, "pMSE"],
+            S_pMSE   = tab[, "S_pMSE"],
+            df       = as.integer(tab[, "df"]),
+            stringsAsFactors = FALSE
+          ))
+        }
+        jaspResults[["utilityTable"]] <- utilityTable
+      }
+
+      if (showOverall) {
+        overallTable <- jaspBase::createJaspTable(title = "Overall Utility")
+        overallTable$addColumnInfo(name = "pMSE",   title = "pMSE",   type = "number", format = "sf:4")
+        overallTable$addColumnInfo(name = "S_pMSE", title = "S_pMSE", type = "number", format = "dp:3")
+        overallTable$addFootnote(paste(
+          "Overall utility from a CART model that uses all selected variables at once to",
+          "distinguish original from synthetic rows. S_pMSE is estimated by permutation."
+        ))
+        overall <- tryCatch({
+          set.seed(seed)
+          synthpop::utility.gen(
+            utilityData$synthetic, utilityData$original,
+            print.flag = FALSE
+          )
+        }, error = function(e) e)
+        if (inherits(overall, "error")) {
+          overallTable$setError(paste("Could not compute overall utility:", conditionMessage(overall)))
+        } else {
+          overallTable$setData(data.frame(pMSE = overall$pMSE, S_pMSE = overall$S_pMSE))
+        }
+        jaspResults[["overallUtility"]] <- overallTable
+      }
+
+      if (showComparePlots) {
+        nPanelCols <- min(3L, ncol(syn))
+        nPanelRows <- ceiling(ncol(syn) / nPanelCols)
+        comparePlot <- jaspBase::createJaspPlot(
+          title  = "Distribution Comparison",
+          width  = 300 * nPanelCols,
+          height = 250 * nPanelRows + 60
+        )
+        if (is.null(compareResult)) {
+          comparePlot$setError(paste("Could not create plots:", compareError))
+        } else {
+          comparePlot$plotObject <- compareResult$plots
+        }
+        jaspResults[["comparisonPlots"]] <- comparePlot
+      }
+    }
 
     createSynDataset <- if (exists("createJaspDataset",
                                    envir    = asNamespace("jaspBase"),
